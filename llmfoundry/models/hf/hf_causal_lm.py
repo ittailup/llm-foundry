@@ -5,6 +5,7 @@
 
 import os
 from typing import Mapping, Union
+from warnings import warn
 
 # required for loading a python model into composer
 import transformers
@@ -24,24 +25,33 @@ from llmfoundry.models.hf.model_wrapper import HuggingFaceModelWithZLoss
 from llmfoundry.models.utils import init_empty_weights
 
 try:
-    from peft.peft_model import PeftModel
-    model_types = PeftModel, transformers.PreTrainedModel
-    _om_model_config_type = Union[DictConfig, PeftModel,
-                                  transformers.PreTrainedModel]
+    from peft import LoraConfig, get_peft_model
+    _peft_installed = True
 
 except ImportError:
-    model_types = transformers.PreTrainedModel
-    _om_model_config_type = Union[DictConfig, transformers.PreTrainedModel]
+    # raising warnings below only if users try to use PEFT
+    _peft_installed = False
 
 __all__ = ['ComposerHFCausalLM']
+
+
+def print_trainable_parameters(model) -> None:
+    # Prints the number of trainable parameters in the model.
+    trainable_params = 0
+    all_param = 0
+    for _, param in model.named_parameters():
+        all_param += param.numel()
+        if param.requires_grad:
+            trainable_params += param.numel()
+    print(
+        f'trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param}'
+    )
 
 
 class ComposerHFCausalLM(HuggingFaceModelWithZLoss):
     """Configures a :class:`.HuggingFaceModel` around a Causal LM.
 
     Args:
-        om_model_config (DictConfig | PeftModel | transformers.PreTrainedModel): either an omegaconf dictionary used to configure the model, or an instantiated model object from the peft or transformers library.
-        if DictConfig, the following keys are required:
             cfg.pretrained_model_name_or_path (str): The name of or local path to
                 the HF Causal LM (e.g., `gpt2` to instantiate a GPT2LMHeadModel).
             cfg.config_overrides (dict, optional): An optional dictionary of keyword
@@ -138,46 +148,85 @@ class ComposerHFCausalLM(HuggingFaceModelWithZLoss):
             elif resolved_init_device == 'meta':
                 if om_model_config.pretrained:
                     raise ValueError(
-                        'Setting cfg.pretrained=True is not supported when init_device="meta".'
-                    )
-                with init_empty_weights(include_buffers=False):
-                    model = AutoModelForCausalLM.from_config(
-                        config,
-                        trust_remote_code=trust_remote_code,
-                    )
+                        f'Config dict override got unknown keys. '
+                        f'Extra keys: {extra_keys}. '
+                        f'Expected (a subset of) keys: {list(attr.keys())}.')
+                getattr(config, k).update(v)
             else:
-                raise ValueError(
-                    f'init_device="{init_device}" must be either "cpu" or "meta".'
+                setattr(config, k, v)
+
+        # below we set up the device to initialize the model on
+        init_device = om_model_config.get('init_device', 'cpu')
+
+        # Get the device we want to initialize, and use the
+        # reolved version to initialize the HF model
+        resolved_init_device = hf_get_init_device(init_device)
+
+        # We need to have all non-zero local ranks be not-pretrained
+        # Rank 0 will still be pretrained, and distribute the weights appropriately
+        if dist.get_local_rank() != 0 and init_device == 'mixed':
+            om_model_config.pretrained = False
+
+        # initialize the model on the correct device
+        if resolved_init_device == 'cpu':
+            if om_model_config.pretrained:
+                model = AutoModelForCausalLM.from_pretrained(
+                    om_model_config.pretrained_model_name_or_path,
+                    trust_remote_code=trust_remote_code,
+                    use_auth_token=use_auth_token,
+                    config=config)
+            else:
+                model = AutoModelForCausalLM.from_config(
+                    config,
+                    trust_remote_code=trust_remote_code,
                 )
-
-            signal_file_path = '.local_rank0_completed_autoresume'
-            if dist.get_local_rank() == 0:
-                with open(signal_file_path, 'wb') as f:
-                    f.write(b'local_rank0_completed_download')
-
-            # Avoid the collective call until the local rank zero has finished trying to download the checkpoint
-            # so that we don't timeout for large downloads. This syncs all processes on the node
-            with dist.local_rank_zero_download_and_wait(signal_file_path):
-                # Then, wait to ensure every node has finished downloading the checkpoint
-                dist.barrier()
-
-            if dist.get_local_rank() == 0:
-                os.remove(signal_file_path)
-
-            z_loss = om_model_config.get('z_loss', 0.0)
-
-        # elif the model is either a PeftModel or a PreTrainedModel
-        elif isinstance(om_model_config, model_types):
-            model = om_model_config
-            init_device = 'cpu'
-            z_loss = 0.0
-
-        # else, unsupported type
+        elif resolved_init_device == 'meta':
+            if om_model_config.pretrained:
+                raise ValueError(
+                    'Setting cfg.pretrained=True is not supported when init_device="meta".'
+                )
+            with init_empty_weights(include_buffers=False):
+                model = AutoModelForCausalLM.from_config(
+                    config,
+                    trust_remote_code=trust_remote_code,
+                )
         else:
             raise ValueError(
-                f'om_model_config must be either a DictConfig, PeftModel, or PreTrainedModel, but got {type(om_model_config)}'
-            )
+                f'init_device="{init_device}" must be either "cpu" or "meta".')
 
+        signal_file_path = '.local_rank0_completed_autoresume'
+        if dist.get_local_rank() == 0:
+            with open(signal_file_path, 'wb') as f:
+                f.write(b'local_rank0_completed_download')
+
+        # Avoid the collective call until the local rank zero has finished trying to download the checkpoint
+        # so that we don't timeout for large downloads. This syncs all processes on the node
+        with dist.local_rank_zero_download_and_wait(signal_file_path):
+            # Then, wait to ensure every node has finished downloading the checkpoint
+            dist.barrier()
+
+        if dist.get_local_rank() == 0:
+            os.remove(signal_file_path)
+
+        z_loss = om_model_config.get('z_loss', 0.0)
+
+        # if om_model_config includes lora and peft is installed, add lora modules
+        lora_cfg = om_model_config.get('lora', None)
+        if lora_cfg is not None:
+            if _peft_installed == True:
+                print('Building Lora config...')
+                lora_cfg = LoraConfig(**lora_cfg.args)
+                print('Lora config built.')
+                print('Adding Lora modules...')
+                model = get_peft_model(model, lora_cfg)
+                print('Lora modules added.')
+                print_trainable_parameters(model)
+            else:
+                warn(
+                    "cfg.model.lora is given but PEFT not installed, so not building a PEFT model. Execute pip install -e \".[gpu,peft]\" and try again."
+                )
+
+        print('Wrapping model in composer...')
         composer_model = super().__init__(model=model,
                                           shift_labels=True,
                                           tokenizer=tokenizer,
